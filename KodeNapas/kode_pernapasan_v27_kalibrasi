@@ -1,0 +1,460 @@
+/**
+ * @file kode_pernapasan_v27_orig_cal.ino
+ * @brief ORIGINAL Peak/Valley + Auto-Calibration ONLY
+ *
+ * IDENTICAL algorithm to kode_pernapasan_v27_uji.ino, with ONE addition:
+ * auto-calibration to set MIN_DELTA, DEAD_ZONE, MIN_BREATH_SIZE from
+ * the filtered AC signal. Everything else (filter fc, detrend alpha,
+ * smoothed_period EMA, FAST/SLOW threshold, HOLD timeout, etc.) is
+ * EXACTLY the same as the original.
+ *
+ * Calibration: 8 seconds, filtered AC → P5-P95 signal_range + MAD noise floor
+ */
+
+#include <Arduino.h>
+#include <SPIFFS.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "BluetoothSerial.h"
+#include <Preferences.h>
+
+// ============================================================================
+// PIN & HARDWARE (IDENTICAL to original)
+// ============================================================================
+#define PIN_SENSOR      34
+#define PIN_LED         2
+#define SERIAL_BAUD     115200
+#define PIN_BTN_UP      18
+#define PIN_BTN_DOWN    19
+#define PIN_BTN_OK      32
+#define I2C_SDA_PIN     21
+#define I2C_SCL_PIN     22
+
+// ============================================================================
+// FILTER — IDENTICAL to original (1.5Hz)
+// ============================================================================
+static const float FILTER_B[3] = {0.007821f, 0.015642f, 0.007821f};
+static const float FILTER_A[3] = {1.0f, -1.73471f, 0.76599f};
+
+// ============================================================================
+// DSP — IDENTICAL to original (hardcoded constants, calibrated ones in struct)
+// ============================================================================
+#define SAMPLE_RATE_HZ              50
+#define SAMPLING_PERIOD_MS          20
+#define DETREND_ALPHA_FAST          0.98f
+#define DETREND_ALPHA_HOLD          0.999f
+#define PERIOD_FAST_SLOW_THRES      1000.0f   // original: 1000ms
+#define PERIOD_ALPHA_START          600.0f
+#define PERIOD_ALPHA_END            1400.0f
+#define MIN_BREATH_DURATION         150
+#define HOLD_LOCKDOWN_MS            3000       // original: 3000ms
+#define MAX_DELTA                   400.0f
+#define CENTER_OFFSET               1000.0f
+
+// ---- Calibration ----
+#define CALIB_DURATION_MS           12000
+#define CALIB_WARMUP_MS             1500
+#define CALIB_SEED_SAMPLES          5
+#define CALIB_MAX_SAMPLES           450
+#define CALIB_BASELINE_ALPHA        0.98f  // slower than detection so AC captures full swing
+#define CALIB_MIN_SIGNAL_RANGE      30.0f
+#define CALIB_MAX_SIGNAL_RANGE      2000.0f
+#define CALIB_MAX_NOISE_TO_RANGE    0.25f
+#define FALLBACK_NOISE_FLOOR        10.0f
+#define FALLBACK_SIGNAL_RANGE       400.0f
+
+// ============================================================================
+// STRUCT TYPEDEFS
+// ============================================================================
+typedef struct { float x[3], y[3]; } iir_sec_t;
+
+typedef struct {
+  float baseline, noise_floor, signal_range, dead_zone, min_breath_size;
+  uint8_t is_valid;
+} calib_t;
+
+typedef struct {
+  iir_sec_t stage1;
+  float baseline, smoothed_period;
+  bool is_inhaling;
+  float local_max, local_min;
+  uint32_t time_at_max, time_at_min, last_event_timestamp;
+  float last_amplitude, last_peak_level, last_valley_level;
+  calib_t calib;
+} breath_analyzer_t;
+
+typedef struct {
+  float filtered, ac_signal;
+  bool is_inhaling, event_detected, is_holding;
+  int event_type;
+  uint32_t event_time;
+  uint8_t current_mode;
+} breath_data_t;
+
+// ============================================================================
+// GLOBALS
+// ============================================================================
+static Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+static BluetoothSerial SerialBT;
+static Preferences prefs;
+
+static volatile bool logToFlash = false;
+static volatile bool sendViaBT  = false;
+static volatile bool isDumping  = false;
+
+static breath_analyzer_t g_eng;
+static calib_t g_cal;
+static QueueHandle_t g_q;
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+static void sort_floats(float *arr, int n) {
+  for(int i=1;i<n;i++){
+    float key=arr[i]; int j=i-1;
+    while(j>=0 && arr[j]>key){ arr[j+1]=arr[j]; j--; }
+    arr[j+1]=key;
+  }
+}
+
+static float apply_iir(iir_sec_t *s, float in) {
+  s->x[2]=s->x[1]; s->x[1]=s->x[0]; s->x[0]=in;
+  float out = FILTER_B[0]*s->x[0] + FILTER_B[1]*s->x[1] + FILTER_B[2]*s->x[2]
+            - FILTER_A[1]*s->y[1] - FILTER_A[2]*s->y[2];
+  s->y[2]=s->y[1]; s->y[1]=out; s->y[0]=out;
+  return out;
+}
+
+// ============================================================================
+// KALIBRASI — hanya menghasilkan threshold untuk deteksi original
+// ============================================================================
+static calib_t calib_run(void) {
+  iir_sec_t cal_filt;
+  for(int i=0;i<3;i++){ cal_filt.x[i]=0; cal_filt.y[i]=0; }
+
+  float seed_sum=0, filt_sum=0;
+  int sc=0, seed_count=0;
+  float baseline_ema=0;
+  float samp_buf[CALIB_MAX_SAMPLES];
+  float diff_buf[CALIB_MAX_SAMPLES];
+  int buf_count=0, diff_count=0;
+  float prev_ac=0;
+  uint32_t t0=millis(), last_sample=0;
+
+  while(1){
+    uint32_t now=millis();
+    if(now-last_sample >= SAMPLING_PERIOD_MS){
+      last_sample=now;
+      float raw=(float)analogRead(PIN_SENSOR);
+      float filt=apply_iir(&cal_filt, raw);
+
+      if(seed_count<CALIB_SEED_SAMPLES){
+        seed_sum+=filt; seed_count++;
+        if(seed_count==CALIB_SEED_SAMPLES) baseline_ema=seed_sum/(float)CALIB_SEED_SAMPLES;
+      } else {
+        baseline_ema=CALIB_BASELINE_ALPHA*baseline_ema+(1.0f-CALIB_BASELINE_ALPHA)*filt;
+      }
+      float ac=filt-baseline_ema;
+
+      if(now-t0>=CALIB_WARMUP_MS && seed_count>=CALIB_SEED_SAMPLES){
+        filt_sum+=filt; sc++;
+        if(buf_count<CALIB_MAX_SAMPLES) samp_buf[buf_count++]=ac;
+        if(buf_count>1){
+          float d=fabsf(ac-prev_ac);
+          if(diff_count<CALIB_MAX_SAMPLES) diff_buf[diff_count++]=d;
+        }
+        prev_ac=ac;
+      }
+
+      float prog=constrain((float)(now-t0)/CALIB_DURATION_MS,0.0f,1.0f);
+      oled.clearDisplay();
+      oled.setCursor(0,0);  oled.print(F("KALIBRASI"));
+      oled.setCursor(0,16); oled.print(F("Bernapas normal..."));
+      int bw=(int)(prog*120);
+      oled.fillRect(4,36,bw,12,WHITE); oled.drawRect(4,36,120,12,WHITE);
+      oled.setCursor(0,52); oled.printf("ADC:%.0f",raw);
+      oled.display();
+
+      if(now-t0>=CALIB_DURATION_MS) break;
+    }
+    delay(5);
+  }
+
+  calib_t c;
+  c.baseline=2048.0f; c.noise_floor=FALLBACK_NOISE_FLOOR;
+  c.signal_range=FALLBACK_SIGNAL_RANGE; c.is_valid=0;
+
+  if(sc>=10 && buf_count>=10){
+    c.baseline=filt_sum/sc;
+    sort_floats(samp_buf,buf_count);
+    int p5_idx=max((int)(buf_count*0.05f),0), p95_idx=min((int)(buf_count*0.95f),buf_count-1);
+    float p5=samp_buf[p5_idx], p95=samp_buf[p95_idx];
+    float ac_peak=max(fabsf(p5),fabsf(p95)), ac_range=p95-p5;
+    c.signal_range=max(ac_range,3.0f);
+    c.signal_range=min(c.signal_range, ac_peak*6.0f);
+
+    // Noise from median absolute difference
+    if(diff_count>10){
+      sort_floats(diff_buf,diff_count);
+      float median_diff=diff_buf[diff_count/2];
+      c.noise_floor=median_diff*1.05f;
+    } else { c.noise_floor=4.0f; }
+    c.noise_floor=max(c.noise_floor,0.5f);
+    c.noise_floor=min(c.noise_floor, c.signal_range*0.3f);
+
+    if(c.signal_range>=CALIB_MIN_SIGNAL_RANGE && c.signal_range<=CALIB_MAX_SIGNAL_RANGE
+       && c.noise_floor<(c.signal_range*CALIB_MAX_NOISE_TO_RANGE)) c.is_valid=1;
+  }
+
+  // Map calibrated range to original-style thresholds
+  float nf=c.noise_floor, r_=c.signal_range;
+  c.dead_zone=constrain(nf*3.0f, 4.0f, r_*0.25f);
+  c.dead_zone=min(c.dead_zone, 80.0f);
+  // v1: r*0.12 → 12% of peak-to-peak. For shallow breathers, use 8% for
+  // extra sensitivity (200 ADC swing → MB=16 vs 24). Still capped at 80.
+  c.min_breath_size=constrain(r_*0.08f, max(nf*2.0f, 8.0f), r_*0.6f);
+  c.min_breath_size=min(c.min_breath_size, 80.0f);
+
+  oled.clearDisplay();
+  oled.setCursor(0,0); oled.print(c.is_valid?F("Kalibrasi OK!"):F("Kalibrasi GAGAL (fallback)"));
+  oled.setCursor(0,24); oled.printf("R:%.0f N:%.1f",c.signal_range,c.noise_floor);
+  oled.setCursor(0,40); oled.printf("DZ:%.0f MB:%.0f",c.dead_zone,c.min_breath_size);
+  oled.display(); delay(2000);
+  return c;
+}
+
+static void calib_save(const calib_t *c) {
+  prefs.begin("b300oc",false);
+  prefs.putFloat("bl",c->baseline); prefs.putFloat("nf",c->noise_floor);
+  prefs.putFloat("sr",c->signal_range); prefs.putUChar("iv",c->is_valid);
+  prefs.end();
+}
+static bool calib_load(calib_t *c) {
+  prefs.begin("b300oc",true);
+  c->baseline=prefs.getFloat("bl",0); c->noise_floor=prefs.getFloat("nf",0);
+  c->signal_range=prefs.getFloat("sr",0); c->is_valid=prefs.getUChar("iv",0);
+  prefs.end();
+  if(c->is_valid && c->signal_range>1.0f){
+    float nf=c->noise_floor, r_=c->signal_range;
+    c->dead_zone=constrain(nf*3.0f, 4.0f, r_*0.25f);
+    c->dead_zone=min(c->dead_zone, 80.0f);
+    c->min_breath_size=constrain(r_*0.08f, max(nf*2.0f, 8.0f), r_*0.6f);
+    c->min_breath_size=min(c->min_breath_size, 80.0f);
+    return true;
+  }
+  return false;
+}
+
+// ============================================================================
+// ENGINE — IDENTICAL algorithm, calibrated thresholds
+// ============================================================================
+static void eng_reset(breath_analyzer_t *e, float iv, const calib_t *c) {
+  for(int i=0;i<3;i++){ e->stage1.x[i]=iv; e->stage1.y[i]=iv; }  // original: y=iv
+  e->baseline=iv; e->is_inhaling=false;
+  e->local_max=-99999; e->local_min=99999;
+  // v2: seed from calibration so small signals (≥150 ADC swing) can be detected
+  e->last_peak_level=iv+c->min_breath_size;
+  e->last_valley_level=iv-c->min_breath_size;
+  e->last_amplitude=c->min_breath_size*2;
+  e->last_event_timestamp=millis(); e->smoothed_period=800.0f; // original
+  e->time_at_max=0; e->time_at_min=0;
+  e->calib=*c;
+}
+
+static void eng_update(breath_analyzer_t *e, float raw, uint32_t now, breath_data_t *out) {
+  memset(out,0,sizeof(breath_data_t));
+  float out1=apply_iir(&e->stage1,raw); out->filtered=out1;
+
+  // --- IDENTICAL period EMA (0.8/0.2) ---
+  float raw_period=now-e->last_event_timestamp;
+  if(raw_period<1)raw_period=1;
+  e->smoothed_period=0.8f*e->smoothed_period+0.2f*raw_period;  // original
+
+  float t=constrain((e->smoothed_period-PERIOD_ALPHA_START)/(PERIOD_ALPHA_END-PERIOD_ALPHA_START),0.0f,1.0f);
+  float alpha=(1.0f-t)*DETREND_ALPHA_FAST+t*DETREND_ALPHA_HOLD; // original
+  e->baseline=alpha*e->baseline+(1.0f-alpha)*out1;               // original
+  out->ac_signal=out1-e->baseline;
+  float ac=out->ac_signal;
+  out->is_holding=(raw_period>HOLD_LOCKDOWN_MS);
+
+  calib_t *cal=&e->calib;
+
+  // --- IDENTICAL FAST/SLOW threshold selection at 1000ms ---
+  float active_min_delta, active_dead_zone, active_ratio_exhale, active_ratio_inhale;
+  if(e->smoothed_period>PERIOD_FAST_SLOW_THRES){
+    out->current_mode=1;
+    active_min_delta=cal->dead_zone*1.5f;       // calibrated
+    active_dead_zone=cal->dead_zone;             // calibrated
+    active_ratio_exhale=0.25f; active_ratio_inhale=0.20f;  // original
+  } else {
+    out->current_mode=0;
+    active_min_delta=max(cal->dead_zone*0.4f, 30.0f);  // floor 30 = original MIN_DELTA_FAST
+    active_dead_zone=max(cal->dead_zone*0.3f, 30.0f);  // floor 30 = original DEAD_ZONE_FAST
+    active_ratio_exhale=0.08f; active_ratio_inhale=0.15f;  // original
+  }
+  float active_min_breath=cal->min_breath_size;
+
+  out->event_detected=false; out->event_type=0; out->event_time=now;
+
+  // --- IDENTICAL peak/valley logic ---
+  if(e->is_inhaling){
+    if(ac>e->local_max){ e->local_max=ac; e->time_at_max=now; }
+    float delta=max(e->last_amplitude*active_ratio_exhale, active_min_delta);
+    if(out->is_holding) delta=MAX_DELTA;  // original
+
+    if(ac<(e->local_max-delta) && e->local_max>active_dead_zone){
+      if((e->time_at_max-e->last_event_timestamp)>MIN_BREATH_DURATION){
+        float height=e->local_max-e->last_valley_level;
+        if(height>active_min_breath){
+          e->is_inhaling=false; e->last_amplitude=height; e->last_peak_level=e->local_max;
+          e->last_event_timestamp=e->time_at_max; e->local_min=ac; e->time_at_min=now;
+          out->event_detected=true; out->event_type=1; out->event_time=e->time_at_max;
+          digitalWrite(PIN_LED,LOW);
+        }
+      }
+    }
+  } else {
+    if(ac<e->local_min){ e->local_min=ac; e->time_at_min=now; }
+    float delta=max(e->last_amplitude*active_ratio_inhale, active_min_delta);
+    if(out->is_holding) delta=MAX_DELTA;  // original
+
+    if(ac>(e->local_min+delta) && e->local_min<-active_dead_zone){
+      if((e->time_at_min-e->last_event_timestamp)>MIN_BREATH_DURATION){
+        float depth=e->last_peak_level-e->local_min;
+        if(depth>active_min_breath){
+          e->is_inhaling=true; e->last_amplitude=depth; e->last_valley_level=e->local_min;
+          e->last_event_timestamp=e->time_at_min; e->local_max=ac; e->time_at_max=now;
+          out->event_detected=true; out->event_type=-1; out->event_time=e->time_at_min;
+          digitalWrite(PIN_LED,HIGH);
+        }
+      }
+    }
+  }
+  out->is_inhaling=e->is_inhaling;
+}
+
+// ============================================================================
+// RTOS TASKS
+// ============================================================================
+static void tAlgo(void *pv) {
+  TickType_t tick=xTaskGetTickCount();
+  const TickType_t freq=pdMS_TO_TICKS(SAMPLING_PERIOD_MS);
+  for(;;){
+    vTaskDelayUntil(&tick,freq);
+    float raw=(float)analogRead(PIN_SENSOR);
+    breath_data_t d;
+    eng_update(&g_eng,raw,millis(),&d);
+    xQueueSend(g_q,&d,0);
+  }
+}
+
+static void tData(void *pv) {
+  breath_data_t rx;
+  for(;;){
+    if(xQueueReceive(g_q,&rx,portMAX_DELAY)==pdPASS){
+      Serial.print("Input:"); Serial.print(rx.filtered);
+      Serial.print(",AC:"); Serial.print(rx.ac_signal+CENTER_OFFSET);
+      Serial.print(",State:"); Serial.println(rx.is_inhaling?CENTER_OFFSET+300:CENTER_OFFSET-300);
+
+      if(rx.event_detected){
+        if(logToFlash && !isDumping){
+          File f=SPIFFS.open("/bl.csv","a");
+          if(f){
+            if(f.size()==0) f.println("t,ev");
+            f.printf("%lu,%d\n",rx.event_time,rx.event_type);
+            f.close();
+          }
+        }
+        if(sendViaBT && SerialBT.hasClient()) SerialBT.printf("%lu,%d\n",rx.event_time,rx.event_type);
+      }
+    }
+  }
+}
+
+static void tUI(void *pv) {
+  uint32_t press_start=0; bool pressing=false;
+  for(;;){
+    if(digitalRead(PIN_BTN_UP)==LOW){ logToFlash=!logToFlash; vTaskDelay(pdMS_TO_TICKS(300)); }
+    if(digitalRead(PIN_BTN_DOWN)==LOW){ sendViaBT=!sendViaBT; vTaskDelay(pdMS_TO_TICKS(300)); }
+
+    if(digitalRead(PIN_BTN_OK)==LOW){
+      if(!pressing){ press_start=millis(); pressing=true; }
+    } else if(pressing){
+      uint32_t durasi=millis()-press_start;
+      if(durasi>=2000){
+        // LONG PRESS: Recalibrate
+        oled.clearDisplay(); oled.setCursor(0,20); oled.print("REKALIBRASI..."); oled.display();
+        prefs.begin("b300oc",false); prefs.clear(); prefs.end();
+        g_cal=calib_run();
+        if(g_cal.is_valid) calib_save(&g_cal);
+        eng_reset(&g_eng,g_cal.baseline,&g_cal);
+        SPIFFS.remove("/bl.csv");
+      } else if(durasi>50){
+        // SHORT PRESS: Dump CSV
+        oled.clearDisplay(); oled.setCursor(0,20); oled.print("DUMPING..."); oled.display();
+        if(SerialBT.hasClient()){
+          isDumping=true;
+          File f=SPIFFS.open("/bl.csv","r");
+          if(!f||f.size()==0) SerialBT.println("--- KOSONG ---");
+          else{ SerialBT.println("=== DUMP ==="); while(f.available())SerialBT.write(f.read()); SerialBT.println("=== END ==="); f.close(); }
+          isDumping=false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+      pressing=false;
+    }
+
+    oled.clearDisplay();
+    oled.setCursor(0,0);  oled.print("--- B300 ORIG+CAL ---");
+    oled.setCursor(0,16); oled.print("18 Log:"); oled.print(logToFlash?"ON":"OFF");
+    oled.setCursor(0,30); oled.print("19 BT:");  oled.print(sendViaBT?"ON":"OFF");
+    oled.setCursor(0,44); oled.print("32 OK: dump/recal");
+    oled.setCursor(0,56);
+    File f=SPIFFS.open("/bl.csv","r");
+    if(f){ oled.printf("Sz:%d %s",f.size(),g_cal.is_valid?"[CAL]":"[FALL]"); f.close(); }
+    else oled.print("Sz:0 [FALL]");
+    oled.display();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ============================================================================
+// SETUP & LOOP
+// ============================================================================
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  pinMode(PIN_LED,OUTPUT); digitalWrite(PIN_LED,LOW);
+  pinMode(PIN_BTN_UP,INPUT_PULLUP); pinMode(PIN_BTN_DOWN,INPUT_PULLUP); pinMode(PIN_BTN_OK,INPUT_PULLUP);
+
+  Wire.begin(I2C_SDA_PIN,I2C_SCL_PIN);
+  if(oled.begin(SSD1306_SWITCHCAPVCC,0x3C)){
+    oled.clearDisplay(); oled.setTextColor(WHITE);
+    oled.setCursor(10,20); oled.print("Booting Orig+Cal...");
+    oled.display();
+  } else Serial.println("OLED Fail");
+
+  SerialBT.begin("B300_Breath_Belt");
+  SPIFFS.begin(true);
+
+  if(!calib_load(&g_cal)){
+    g_cal=calib_run();
+    if(g_cal.is_valid) calib_save(&g_cal);
+  }
+
+  // Original: average 50 samples for seed
+  float sum=0;
+  for(int i=0;i<50;i++){ sum+=analogRead(PIN_SENSOR); delay(20); }
+  eng_reset(&g_eng, sum/50.0f, &g_cal);
+
+  g_q=xQueueCreate(20,sizeof(breath_data_t));
+
+  xTaskCreatePinnedToCore(tAlgo,"Algo",4096,NULL,3,NULL,1);
+  xTaskCreatePinnedToCore(tData,"Data",4096,NULL,2,NULL,0);
+  xTaskCreatePinnedToCore(tUI,  "UI",  4096,NULL,1,NULL,0);
+
+  Serial.println("=== READY Original + Calibration ===");
+  Serial.println("Algo: 100%% original. Kalibrasi: 8s, MAD noise + P5-P95 signal.");
+}
+
+void loop() { vTaskDelete(NULL); }
