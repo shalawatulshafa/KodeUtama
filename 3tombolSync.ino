@@ -15,8 +15,8 @@
 #include "soc/rtc_cntl_reg.h"
 
 #include "StepSensor.h"
-#include "BatteryMgr.h"
-#include "BreathSensor.h"
+#include "BatteryMgrV2.h"
+#include "BreathSensorV2.h"
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -94,7 +94,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 BluetoothA2DPSource a2dp_source;
 Preferences preferences;
 StepSensor stepSensor;
-BreathSensor breathSensor;
+BreathSensorV2 breathSensor;
 
 BatteryMgr battery;
 SemaphoreHandle_t wireMutex = NULL;
@@ -115,6 +115,7 @@ enum UIState {
   STATE_SELECTING,
   STATE_PAIRING,
   STATE_MENU_PATTERN,
+  STATE_CALIBRATING,
   STATE_MAIN_MENU,
   STATE_SYNC
 };
@@ -275,6 +276,10 @@ const int LONG_PRESS_MS           = 800;
 const int SLEEP_PRESS_MS          = 2000;
 unsigned long ignore_btn_until    = 0;
 bool trigger_hard_scan            = false;
+bool calib_redo                   = false;   // trigger rekalibrasi dari handleInput
+int  calib_beep_count             = 0;       // non-blocking beep sequence (gagal)
+unsigned long calib_beep_next_ms  = 0;       // timer beep berikutnya
+int  calib_beep_state             = 0;       // 0=on, 1=jeda antar beep
 
 // ==========================================
 // FORWARD DECLARATIONS
@@ -444,7 +449,13 @@ int32_t get_sound_data(uint8_t *data, int32_t len) {
     return 0;
   }
   // -------------------------
-  if (is_shutting_down || current_state != STATE_IDLE) {
+  if (is_shutting_down) {
+    memset(data, 0, len);
+    return len;
+  }
+  // Saat STATE_CALIBRATING, izinkan tone feedback (berhasil/gagal/panduan napas)
+  // tapi JANGAN proses audio guidance lari biasa.
+  if (current_state != STATE_IDLE && current_state != STATE_CALIBRATING) {
     memset(data, 0, len);
     return len;
   }
@@ -1138,7 +1149,13 @@ void handleInput() {
   if (btn_up_read == LOW) {
      if (now - last_btn_press_time > DEBOUNCE_DELAY) {
         last_btn_press_time = now;
-        if (current_state == STATE_IDLE && a2dp_source.is_connected()) {
+        if (current_state == STATE_CALIBRATING) {
+            // UP = lanjut lari (terima hasil kalibrasi)
+            current_state = STATE_IDLE;
+            updateDisplay("READY", "GO RUN!", true);
+            digitalWrite(PIN_LED, HIGH);
+            ignore_btn_until = now + 1000;
+        } else if (current_state == STATE_IDLE && a2dp_source.is_connected()) {
             current_volume = (current_volume >= 120) ? 127 : current_volume + 5;
             a2dp_source.set_volume(current_volume);
         } else if (current_state == STATE_MAIN_MENU) {
@@ -1270,10 +1287,12 @@ void handleInput() {
                 a2dp_source.start((std::vector<const char*>){{}});
                 a2dp_active = true;
             }
+        } else if (current_state == STATE_CALIBRATING) {
+            // OK short press saat hasil kalibrasi = ulangi kalibrasi
+            current_state = STATE_CALIBRATING;  // trigger ulang di loop()
+            calib_redo = true;
         } else if (current_state == STATE_MENU_PATTERN) {
-            // SAFETY: cek koneksi earphone sebelum transisi ke STATE_IDLE.
-            // Kalau earphone mati saat user lagi di menu pola, jangan lanjut —
-            // STATE_IDLE tanpa A2DP = audio guidance mati & user nyangka stuck.
+            // SAFETY: cek koneksi earphone sebelum transisi.
             if (!a2dp_source.is_connected()) {
                 updateDisplay("EARPHONE LEPAS!", "Reconnect dulu", false);
                 delay(2000);
@@ -1285,10 +1304,9 @@ void handleInput() {
                 return;
             }
             active_pattern_divisor = (selected_rhythm_index == 0) ? 5 : 3;
-            updateDisplay("READY", "GO RUN!", true);
-            delay(1500);
-            current_state = STATE_IDLE;
-            digitalWrite(PIN_LED, HIGH);
+            // Masuk kalibrasi napas sebelum GO RUN
+            current_state = STATE_CALIBRATING;
+            updateDisplay("KALIBRASI", "Bernapas normal...");
         }
         last_btn_press_time = now;
      }
@@ -1913,8 +1931,10 @@ void setup() {
       delay(1500);
       enterDeepSleep();
   });
-  battery.onLow([](bool isLow) {
-      if (isLow) updateDisplay("LOW BATTERY", "Segera charge!", false);
+  battery.onState([](BatteryState state) {
+      if (state == BatteryState::LOW_BATTERY) {
+          updateDisplay("LOW BATTERY", "Segera charge!", false);
+      }
   });
 #endif
 
@@ -2514,6 +2534,139 @@ void loop() {
 
   if (current_state != STATE_MAIN_MENU) {
       current_connected_status = a2dp_source.is_connected();
+  }
+
+  // ── STATE CALIBRATING ──
+  if (current_state == STATE_CALIBRATING) {
+      static bool calib_started    = false;
+      static bool calib_done       = false;
+      static bool calib_success    = false;
+      static CalibData calib_result;
+
+      // Reset state jika user minta rekalibrasi
+      if (calib_redo) {
+          calib_redo    = false;
+          calib_started = false;
+          calib_done    = false;
+      }
+
+      if (!calib_started) {
+          calib_started = true;
+          calib_done    = false;
+          Serial.println("[CALIB] Memulai kalibrasi napas 12 detik...");
+
+          // Progress callback — update OLED progress bar + panduan napas audio
+          static unsigned long last_calib_tone = 0;
+          static bool calib_is_inhale_tone     = false;  // toggle pertama → true (hirup dulu)
+
+          bool ok = breathSensor.calibrate([](float progress, float raw, bool done) {
+              if (done) return;
+
+              // Update OLED
+              if (xSemaphoreTake(wireMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                  display.clearDisplay();
+                  display.setTextSize(1);
+                  display.setTextColor(SSD1306_WHITE);
+                  display.setCursor(0, 0);
+                  display.println("KALIBRASI NAPAS");
+                  display.setCursor(0, 16);
+                  display.println("Bernapas normal...");
+                  int bw = (int)(progress * 120);
+                  display.fillRect(4, 36, bw, 12, SSD1306_WHITE);
+                  display.drawRect(4, 36, 120, 12, SSD1306_WHITE);
+                  display.setCursor(0, 52);
+                  display.printf("ADC:%.0f", raw);
+                  display.display();
+                  xSemaphoreGive(wireMutex);
+              }
+
+              // Panduan napas: tone naik (hirup) / turun (buang) bergantian tiap 2.5 detik
+              // ~12 BPM = 5 detik per siklus napas
+              if (millis() - last_calib_tone > 2500) {
+                  last_calib_tone = millis();
+                  calib_is_inhale_tone = !calib_is_inhale_tone;
+
+                  if (calib_is_inhale_tone) {
+                      // Hirup: tone naik 440→880 Hz, 2 detik
+                      new_freq_start      = 440.0f;
+                      new_freq_end        = 880.0f;
+                  } else {
+                      // Buang: tone turun 880→440 Hz, 2 detik
+                      new_freq_start      = 880.0f;
+                      new_freq_end        = 440.0f;
+                  }
+                  new_phase_duration  = 2000.0f;  // 2 detik tone
+                  new_sound_requested = true;
+              }
+          });
+
+          calib_success = ok;
+          calib_done    = true;
+          calib_result  = breathSensor.getCalibInfo();
+
+          // Reset tone state
+          last_calib_tone     = 0;
+          calib_is_inhale_tone = true;
+
+          // Hentikan suara panduan agar tone feedback langsung bunyi
+          is_playing_sound = false;
+
+          if (calib_success) {
+              // Berhasil: 1 tone naik (880→1760 Hz, 500ms) — pitch tinggi biar nyaring
+              new_freq_start      = 880.0f;
+              new_freq_end        = 1760.0f;
+              new_phase_duration  = 500.0f;
+              new_sound_requested = true;
+              Serial.printf("[CALIB] BERHASIL: R=%.0f N=%.1f DZ=%.0f MB=%.0f\n",
+                            calib_result.signal_range, calib_result.noise_floor,
+                            calib_result.dead_zone, calib_result.min_breath_size);
+          } else {
+              // Gagal: 3 beep pendek (1320 Hz, 150ms on, 120ms off) — pitch tinggi biar nyaring
+              calib_beep_count    = 3;
+              calib_beep_next_ms  = 0;  // trigger segera
+              calib_beep_state    = 0;
+              Serial.println("[CALIB] GAGAL, fallback threshold dipakai");
+          }
+
+          // Tampilkan hasil
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setTextColor(SSD1306_WHITE);
+          display.setCursor(0, 0);
+          display.println(calib_success ? "Kalibrasi OK!" : "Kalibrasi GAGAL");
+          display.setCursor(0, 16);
+          display.printf("R:%.0f N:%.1f", calib_result.signal_range, calib_result.noise_floor);
+          display.setCursor(0, 28);
+          display.printf("DZ:%.0f MB:%.0f", calib_result.dead_zone, calib_result.min_breath_size);
+          display.setCursor(0, 44);
+          display.println("[OK] ulangi");
+          display.setCursor(0, 56);
+          display.println("[UP] lanjut lari");
+          display.display();
+      }
+
+      // ── Non-blocking beep sequence (kalibrasi gagal) ──
+      if (calib_beep_count > 0 && millis() > calib_beep_next_ms) {
+          if (calib_beep_state == 0) {
+              // Nyalakan beep (1320 Hz — pitch tinggi)
+              new_freq_start      = 1320.0f;
+              new_freq_end        = 1320.0f;
+              new_phase_duration  = 150.0f;
+              new_sound_requested = true;
+              calib_beep_next_ms  = millis() + 150;   // 150ms on
+              calib_beep_state    = 1;
+          } else {
+              // Jeda antar beep (100ms)
+              calib_beep_count--;
+              if (calib_beep_count > 0) {
+                  calib_beep_next_ms  = millis() + 120;  // 120ms off
+                  calib_beep_state    = 0;
+              }
+          }
+      }
+
+      // Tunggu keputusan user via tombol (handleInput akan proses)
+      return;  // blocking — tidak lanjut ke logic lain selama kalibrasi
   }
 
   // ── DISCONNECT GUARD: STATE_MENU_PATTERN ──
