@@ -1,0 +1,74 @@
+@startuml
+title State Machine — 3tombolSync
+
+left to right direction
+skinparam stateFontSize 11
+skinparam stateArrowFontSize 10
+
+[*] --> WAKE_UP
+
+state WAKE_UP {
+    [*] --> Splash : "WAKE UP!"
+    Splash --> CekMode
+    CekMode : baca boot_mode
+    CekMode --> AUDIO : boot = AUDIO
+    CekMode --> SYNC : boot = SYNC
+    CekMode --> SLEEP : boot = DEEP_SLEEP
+    CekMode --> SAFE_MODE : crash 3x
+}
+
+SLEEP : esp_deep_sleep
+SAFE_MODE : tampil error\ntunggu cabut batrai
+
+' ═══ AUDIO ═══
+state AUDIO {
+    [*] --> MENU
+    MENU : 1.Scan 2.Sync 3.Exit
+    MENU --> SCAN : OK
+    MENU --> SYNC : Sync
+    MENU --> RUN : Exit
+
+    SCAN : SCANNING\n(20 detik)
+    SCAN --> PICK : selesai
+
+    PICK : pilih device
+    PICK --> PAIR : OK
+    PICK --> SCAN : rescan
+
+    PAIR : connecting
+    PAIR --> POLA : CONNECTED
+
+    POLA : 3:2 / 2:1
+    POLA --> RUN : OK
+
+    state RUN {
+        [*] --> A
+        A : ANALYZING\nhitung SPM
+        G : GUIDING\ncue + log
+        A --> G : stable>5\n→ REC START
+        G --> A : >3 meleset\n→ REC PAUSE
+    }
+
+    RUN --> MENU : long OK
+    RUN --> SLEEP : OK>2detik
+}
+
+AUDIO --> SLEEP : batrai kritis
+
+' ═══ SYNC ═══
+state SYNC {
+    [*] --> Wait
+    Wait : BLE advertising
+    Wait --> TX : HP→"SYNC"
+    TX : kirim CSV\n(/run.dat)
+    TX --> ACK : EOF
+    ACK : tunggu "OK"
+    ACK --> Done : ACK diterima
+    ACK --> End : timeout
+    Done : hapus file
+    Done --> End
+}
+
+SYNC --> AUDIO : selesai/gagal
+
+@enduml

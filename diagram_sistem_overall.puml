@@ -1,0 +1,155 @@
+@startuml Sistem3tombolSync_Overall
+' ============================================
+' Diagram: Activity Overview — 3tombolSync
+' Menunjukkan alur integrasi seluruh sistem
+' dari boot hingga sync data ke HP.
+' ============================================
+
+title **Sistem 3tombolSync — Diagram Alir Keseluruhan**
+
+|User|
+|Sensor & OLED|
+|Sistem (3tombolSync.ino)|
+|Earphone / HP|
+
+|User|
+start
+:Colok batrai / Tekan OK\n(alat menyala);
+
+|Sistem|
+:BOOT: Cek reset reason\n— Power-on / Crash / Wake —;
+if (Crash > 3x?) then (ya)
+  :ENTER SAFE MODE\nTampil error di OLED;
+  stop
+else (tidak)
+endif
+
+:POWER ON: MOSFET aktif\nOLED init + LittleFS mount;
+
+:Load waktu dari RTC/NVS;
+:Init sensor:\n■ StepSensor (MPU6050)\n■ BreathSensor (ADC);
+note right
+  Kode Anda MEMANGGIL:
+  stepSensor.begin()
+  breathSensor.begin()
+  Tapi algoritma deteksi ada
+  di file terpisah (kode teman)
+end note
+
+:Init battery (MAX17048)
++ register callback;
+
+|Sistem|
+if (Boot mode?) then (SYNC)
+  :BLE SERVICE ON\nAdvertising "Cheaststrap";
+else (AUDIO / Normal)
+  :A2DP SOURCE ON\nSiap streaming audio;
+endif
+
+|User|
+:Scan & Pair Earphone (A2DP);
+|Sistem|
+:A2DP CONNECTED → reset state;
+|User|
+:Pilih Pola Napas:\n■ 3:2 (RELAX)\n■ 2:1 (POWER);
+|Sistem|
+:STATE_IDLE — siap menerima langkah;
+
+|User|
+:Mulai berlari;
+|Sensor & OLED|
+:LANGKAH terdeteksi\n(MPU6050 → StepSensor);
+|Sistem|
+:handleStepAnalysis():
+■ Hitung SPM, T_avg
+■ Cek stabilitas (stable_count)
+■ 5 langkah stabil → STATE_GUIDING;
+
+|Sistem|
+if (Pertama kali GUIDING?) then (ya)
+  :RECORDING MULAI
+  ■ Catat recording_start_ms
+  ■ Tulis SESSION header ke /run.dat
+  ■ naikkan session_id;
+else (tidak)
+  :RESUME recording\n(lanjut sesi yang sama);
+endif
+
+|Sistem|
+:SCHEDULING AUDIO CUE:
+■ Hitung time_to_trigger
+  = N×T_avg − (T_LEAD + L_SYS)
+■ ARM esp_timer;
+
+|Sensor & OLED|
+:NAPAS terdeteksi\n(ADC → BreathSensor);
+|Sistem|
+:Breath phase diterima\n(1 = HIRUP, -1 = BUANG);
+
+|Sistem|
+:WRITE LOG ENTRY:\n[ts_ms | flags | spm]\n→ 6 byte biner → /run.dat;
+
+|Earphone / HP|
+:Audio cue HIRUP/BUANG\nterdengar di earphone;
+
+|Sistem|
+:OLED UPDATE:
+■ Status: GUIDING >>
+■ SPM, Volume, *REC;
+
+|Sistem|
+while (User masih lari?) is (ya)
+  :Langkah berikutnya → loop;
+  if (>3 langkah meleset?) then (ya)
+    :RECORDING PAUSE
+    ■ Audio HENING (guard!)
+    ■ OLED: Status ANALYZING;
+    if (Ritme stabil lagi?) then (ya)
+      :RESUME recording;
+    else (tidak)
+      :Tunggu stabil...;
+    endif
+  endif
+endwhile (Tidak)
+
+|User|
+:Selesai lari / Tombol mati;
+|Sistem|
+:ENTER DEEP SLEEP:
+■ Flush & close /run.dat
+■ Simpan waktu ke RTC+NVS
+■ MOSFET OFF
+■ ESP.restart() → deep sleep path;
+
+|User|
+:Pilih menu SYNC (long-press OK);
+|Sistem|
+:Ganti boot mode → SYNC;
+:ESP.restart() → BLE mode;
+
+|Sistem|
+:BLE ADVERTISING;
+|User|
+:Buka aplikasi Flutter di HP;
+:Tap SYNC;
+|Sistem|
+:Terima "SYNC" dari HP;
+
+|Sistem|
+:BACA /run.dat → konversi BINER→CSV:
+■ 0xFF = SESSION header
+■ Record 6-byte → csvLine;
+
+|Earphone / HP|
+:Kirim CSV via BLE Notify:
+■ Header → data chunked (350 char)
+■ EOF → tunggu ACK;
+
+|Earphone / HP|
+:HP parse data → kirim "OK";
+|Sistem|
+:ACK diterima → HAPUS /run.dat;
+:Selesai → kembali ke AUDIO mode;
+
+stop
+@enduml

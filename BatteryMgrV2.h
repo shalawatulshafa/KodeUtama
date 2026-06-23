@@ -325,8 +325,8 @@ class BatteryMgr {
 
         if (mosfetPinValid) {
             pinMode(pinMosfet, OUTPUT);
-            digitalWrite(pinMosfet, HIGH); // OFF / bypass sesuai hardware kamu
-            Serial.println("[PWR] MOSFET OFF (bypass HW) — peripheral tetap dari AP2112.");
+            digitalWrite(pinMosfet, LOW); // Si2301 active-LOW: LOW=ON
+            Serial.println("[PWR] MOSFET ON — peripheral powered.");
         } else {
             Serial.println("[PWR] MOSFET SKIP — pin tidak valid.");
         }

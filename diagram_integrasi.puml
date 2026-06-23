@@ -1,0 +1,30 @@
+@startuml
+title Integrasi Subsistem — 3tombolSync
+
+left to right direction
+
+' ── INPUT (kiri) ──
+component "STEP SENSOR\n(MPU6050)\n[Kode Teman]" as step #LightBlue
+component "BREATH SENSOR\n(ADC)\n[Kode Teman]"   as breath #LightCoral
+component "BATTERY\n(MAX17048)\n[Kode Tim]"      as bat #LightGreen
+
+' ── SISTEM ANDA (tengah) ──
+component "3TOMBOLSYNC.INO\n[KODE ANDA]" as main #LightYellow
+
+' ── OUTPUT (kanan) ──
+component "OLED\n128x64"     as oled #Wheat
+component "EARPHONE\n(A2DP)" as earphone #Plum
+component "HP FLUTTER\n(BLE)" as hp #Thistle
+
+' ── PANAH ──
+step   -right-> main : isStepDetected()\nSPM
+breath -right-> main : getCurrentPhase()\nHIRUP/BUANG
+bat    -right-> main : getVoltage()/getLevel()\ncallback: critical & low
+
+main -right-> oled     : updateDisplay()
+main -right-> earphone : Audio Cue\n440-880Hz
+main -right-> hp       : CSV via BLE Notify
+
+hp -left-> main : ACK ("OK")
+
+@enduml
